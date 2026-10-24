@@ -224,7 +224,20 @@ public:
 	}
 
 	//these go through command queue if they are in another thread
-	FUNC3(texture_2d_update, RID, const Ref<Image> &, int)
+	// EAWR: queue a snapshot of the Image, not the caller's object (godot#122206). With the Separate render thread
+	// the queued update reads the Image later on the render thread while the caller (the text server's glyph atlas)
+	// keeps writing the same object, so the render thread can see its data empty ("p_image.is_null() || p_image->is_empty()").
+	// Image::duplicate() shares the copy-on-write pixel buffer, so a snapshot costs a copy only if the caller writes again.
+	virtual void texture_2d_update(RID p_texture, const Ref<Image> &p_image, int p_layer) override {
+		WRITE_ACTION
+		if (ASYNC_COND_PUSH) {
+			Ref<Image> snapshot = p_image.is_valid() ? Ref<Image>(p_image->duplicate()) : p_image;
+			command_queue.push(server_name, &ServerName::texture_2d_update, p_texture, snapshot, p_layer);
+		} else {
+			command_queue.flush_if_pending();
+			server_name->texture_2d_update(p_texture, p_image, p_layer);
+		}
+	}
 	FUNC2(texture_3d_update, RID, const Vector<Ref<Image>> &)
 	FUNC4(texture_external_update, RID, int, int, uint64_t)
 	FUNC2(texture_proxy_update, RID, RID)
