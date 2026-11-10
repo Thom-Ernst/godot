@@ -58,7 +58,11 @@
 #define PRINT_NATIVE_COMMANDS 0
 
 // Enable the use of re-spirv for optimizing shaders after applying specialization constants.
-#define RESPV_ENABLED 1
+// EAWR: disabled. Re-spirv keeps a parsed copy of every shader with specialization constants
+// for the life of the shader; with mod-sized shader counts that is ~2.3-2.5 GB of private
+// memory. Measured without it: no first-use hitch regression (AMD RX 7900 XTX, N=3) and
+// bit-identical frames (RTX 4070). Specialization is then left to the driver.
+#define RESPV_ENABLED 0
 
 // Only enable function inlining for re-spirv when dealing with a shader that uses specialization constants.
 #define RESPV_ONLY_INLINE_SHADERS_WITH_SPEC_CONSTANTS 1
