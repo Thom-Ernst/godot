@@ -1,0 +1,157 @@
+name: EAWR engine builds (manual, artifacts only)
+
+# Owner-approved (route A): builds the pinned EAWR fork commit for macOS (arm64 + x86_64, lipo to universal) and, only
+# when asked, Linux arm64 natively. Manual dispatch only: no schedule, no push trigger. Artifacts only (7 days): no
+# release, no tag, no secrets, no signing. The fork is public, so standard GitHub-hosted runners are free.
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Fork commit to build (default: the current pin)
+        default: 5b733a90f6516916dc19d530ecdd433fdd0bc4ee
+        type: string
+      macos:
+        description: Build macOS (arm64 + x86_64 + universal)
+        default: true
+        type: boolean
+      linux_arm64:
+        description: Build Linux arm64 natively (fallback only)
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  BASE_OPTIONS: target=editor production=yes debug_symbols=yes separate_debug_symbols=yes debug_paths_relative=yes warnings=no progress=no
+  BUILD_NAME: eawr
+  SCONS_VERSION: 4.10.1
+
+jobs:
+  macos:
+    if: ${{ inputs.macos }}
+    name: macos ${{ matrix.arch }} lto=${{ matrix.lto }}
+    runs-on: macos-15
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
+        lto: [full, thin]
+    steps:
+      - name: Checkout the pinned commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.commit }}
+          fetch-depth: 20
+          persist-credentials: false
+      - name: Verify the commit
+        run: |
+          test "$(git rev-parse HEAD)" = "${{ inputs.commit }}"
+          git log --format='%H %s' -5
+      - name: Python and SCons
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - run: python -m pip install scons==${SCONS_VERSION} && scons --version
+      - name: Dependencies (ANGLE, AccessKit, Vulkan SDK / MoltenVK)
+        id: deps
+        run: |
+          if python ./misc/scripts/install_angle.py; then echo "angle=yes" >> "$GITHUB_OUTPUT"; else echo "angle=no" >> "$GITHUB_OUTPUT"; fi
+          if python3 ./misc/scripts/install_accesskit.py; then echo "accesskit=yes" >> "$GITHUB_OUTPUT"; else echo "accesskit=no" >> "$GITHUB_OUTPUT"; fi
+          if sh misc/scripts/install_vulkan_sdk_macos.sh; then echo "vulkan=yes" >> "$GITHUB_OUTPUT"; else echo "vulkan=no" >> "$GITHUB_OUTPUT"; fi
+      - name: Build
+        run: |
+          FLAGS="platform=macos arch=${{ matrix.arch }} ${BASE_OPTIONS} lto=${{ matrix.lto }} vulkan=${{ steps.deps.outputs.vulkan }} accesskit=${{ steps.deps.outputs.accesskit }} angle=${{ steps.deps.outputs.angle }} -j3"
+          echo "$FLAGS" > scons-flags.txt
+          START=$(date +%s)
+          scons $FLAGS
+          echo $(( $(date +%s) - START )) > scons-seconds.txt
+          ls -l bin/
+      - name: Describe
+        run: |
+          mkdir -p out
+          cp bin/godot.macos.editor.${{ matrix.arch }} out/
+          cp bin/*.dSYM -r out/ 2>/dev/null || true
+          cp scons-flags.txt scons-seconds.txt out/
+          { echo "runner image: ${ImageOS:-?} ${ImageVersion:-?}"; sw_vers; xcodebuild -version; clang --version | head -1; python --version; scons --version | sed -n 2p; } > out/toolchain.txt 2>&1
+          cd out && shasum -a 256 godot.macos.editor.${{ matrix.arch }} > sha256.txt && shasum -a 512 godot.macos.editor.${{ matrix.arch }} > sha512.txt
+          file godot.macos.editor.${{ matrix.arch }} && cat sha256.txt toolchain.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: eawr-macos-${{ matrix.arch }}-lto-${{ matrix.lto }}
+          path: out/
+          retention-days: 7
+
+  macos-universal:
+    needs: macos
+    if: ${{ !cancelled() && inputs.macos }}
+    name: macos universal lto=${{ matrix.lto }}
+    runs-on: macos-15
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        lto: [full, thin]
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: eawr-macos-*-lto-${{ matrix.lto }}
+          path: in/
+      - name: lipo
+        run: |
+          ls -R in | head -40
+          if [ ! -f in/eawr-macos-arm64-lto-${{ matrix.lto }}/godot.macos.editor.arm64 ] || [ ! -f in/eawr-macos-x86_64-lto-${{ matrix.lto }}/godot.macos.editor.x86_64 ]; then
+            echo "one arch missing for lto=${{ matrix.lto }}; no universal binary"; exit 0
+          fi
+          mkdir -p out
+          lipo -create -output out/godot.macos.editor.universal in/eawr-macos-arm64-lto-${{ matrix.lto }}/godot.macos.editor.arm64 in/eawr-macos-x86_64-lto-${{ matrix.lto }}/godot.macos.editor.x86_64
+          lipo -info out/godot.macos.editor.universal
+          cd out && shasum -a 256 godot.macos.editor.universal > sha256.txt && shasum -a 512 godot.macos.editor.universal > sha512.txt && cat sha256.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: eawr-macos-universal-lto-${{ matrix.lto }}
+          path: out/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  linux-arm64:
+    if: ${{ inputs.linux_arm64 }}
+    name: linux arm64 (native)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    steps:
+      - name: Checkout the pinned commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.commit }}
+          fetch-depth: 20
+          persist-credentials: false
+      - run: test "$(git rev-parse HEAD)" = "${{ inputs.commit }}"
+      - name: Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential pkg-config scons python3 libwayland-bin wayland-protocols \
+            libx11-dev libxcursor-dev libxinerama-dev libxi-dev libxrandr-dev libxext-dev libxrender-dev libxfixes-dev libgl-dev libglu1-mesa-dev \
+            libasound2-dev libpulse-dev libudev-dev libwayland-dev libxkbcommon-dev libdbus-1-dev libfontconfig-dev libdecor-0-dev
+      - name: Build
+        run: |
+          FLAGS="platform=linuxbsd arch=arm64 ${BASE_OPTIONS} lto=full -j4"
+          echo "$FLAGS" > scons-flags.txt
+          START=$(date +%s)
+          scons $FLAGS
+          echo $(( $(date +%s) - START )) > scons-seconds.txt
+          ls -l bin/
+      - name: Describe
+        run: |
+          mkdir -p out
+          cp bin/godot.linuxbsd.editor.arm64* out/
+          cp scons-flags.txt scons-seconds.txt out/
+          { uname -a; gcc --version | head -1; ldd --version | head -1; scons --version | sed -n 2p; } > out/toolchain.txt 2>&1
+          objdump -T out/godot.linuxbsd.editor.arm64 | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1 > out/glibc-floor.txt
+          cd out && sha256sum godot.linuxbsd.editor.arm64* > sha256.txt && sha512sum godot.linuxbsd.editor.arm64* > sha512.txt && cat sha256.txt toolchain.txt glibc-floor.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: eawr-linux-arm64
+          path: out/
+          retention-days: 7
